@@ -1,0 +1,183 @@
+# Construye, escanea y publica cada images/<nombre>/ como ghcr.io/juanjocop/<nombre>.
+#
+# - pull_request: construye y escanea las imágenes tocadas; no publica.
+# - push a main: igual, y si Trivy pasa, publica.
+# - workflow_dispatch: igual que push, para una imagen o para todas.
+# - schedule (lunes): reconstruye y escanea TODAS sin publicar. Si sale un CVE
+#   HIGH/CRITICAL con parche, el run sale en rojo y GitHub avisa por correo; se
+#   arregla con un workflow_dispatch de esa imagen (el `apk upgrade` de cada
+#   Dockerfile recoge el parche) y cambiando el digest donde se consuma.
+#
+# Todas las actions van fijadas por SHA de commit, no por tag: un tag se puede
+# volver a empujar, y en marzo de 2026 a trivy-action le pasó exactamente eso.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Nombre de la imagen (directorio en images/). Vacío = todas."
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      images: ${{ steps.detect.outputs.images }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Los valores del evento entran por env, nunca interpolados en el script.
+      - id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_IMAGE: ${{ inputs.image }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          all() { find images -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' | cut -d/ -f2; }
+          case "$EVENT" in
+            schedule) names=$(all) ;;
+            workflow_dispatch)
+              if [ -n "$INPUT_IMAGE" ]; then names=$INPUT_IMAGE; else names=$(all); fi ;;
+            *)
+              base=${PR_BASE:-$PUSH_BEFORE}
+              if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ] \
+                 || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+                names=$(all)
+              else
+                changed=$(git diff --name-only "$base" "$GITHUB_SHA")
+                # Si cambia el propio workflow, se revalidan todas.
+                if grep -q '^\.github/workflows/' <<<"$changed"; then
+                  names=$(all)
+                else
+                  names=$(grep '^images/[^/]*/' <<<"$changed" | cut -d/ -f2 | sort -u || true)
+                fi
+              fi ;;
+          esac
+          valid=()
+          for n in $names; do
+            [[ "$n" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "::error::nombre de imagen no válido: $n"; exit 1; }
+            # Un directorio borrado en el diff no se construye.
+            if [ -f "images/$n/Dockerfile" ]; then valid+=("$n"); fi
+          done
+          json=$(printf '%s\n' "${valid[@]}" | jq -Rnc '[inputs | select(length > 0)]')
+          echo "images=$json" | tee -a "$GITHUB_OUTPUT"
+
+  image:
+    needs: detect
+    if: needs.detect.outputs.images != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        name: ${{ fromJSON(needs.detect.outputs.images) }}
+    env:
+      CONTEXT: images/${{ matrix.name }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+      PUBLISH: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # Plataformas: images/<nombre>/platforms si existe; si no, solo arm64, que
+      # es lo que son los workers del clúster.
+      - name: Plataformas
+        id: platforms
+        run: |
+          set -euo pipefail
+          f="$CONTEXT/platforms"
+          p=linux/arm64
+          if [ -f "$f" ]; then p=$(tr -s ' \n' ',' < "$f" | sed 's/,$//'); fi
+          [[ "$p" =~ ^linux/[a-z0-9/]+(,linux/[a-z0-9/]+)*$ ]] || { echo "::error::$f no válido: $p"; exit 1; }
+          echo "all=$p" >> "$GITHUB_OUTPUT"
+          echo "first=${p%%,*}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Se escanea la primera plataforma de la lista (arm64 por defecto), que es
+      # la que corre de verdad.
+      - name: Build para escanear
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.CONTEXT }}
+          platforms: ${{ steps.platforms.outputs.first }}
+          load: true
+          tags: ${{ matrix.name }}:scan
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Trivy (puerta)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.name }}:scan
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - name: Metadatos
+        if: env.PUBLISH == 'true'
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          # Fecha + commit: inmutable y legible. Reconstruir el mismo commit otro
+          # día (workflow_dispatch tras un CVE) da otro tag. Nunca `latest`.
+          tags: |
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}}
+
+      - name: Login a GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build y push
+        if: env.PUBLISH == 'true'
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ env.CONTEXT }}
+          platforms: ${{ steps.platforms.outputs.all }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          sbom: true
+          provenance: mode=max
+
+      - name: Referencia para el consumidor
+        if: env.PUBLISH == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          echo "image: ${TAGS}@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
